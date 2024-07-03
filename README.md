@@ -16,6 +16,8 @@ RMT is a memory-augmented segment-level recurrent Transformer. We implement our 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/booydar/t5-experiments/blob/framework_accel/notebooks/rmt_demo_lm.ipynb) Example: LM with RMT
 
 
+This work was done in collaboration of DeepPavlov.ai, AIRI, and London Institute for Mathematical Sciences.
+
 ## Installation
 ```bash
 pip install -e .
