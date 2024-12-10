@@ -16,6 +16,8 @@ import transformers
 
 import lm_experiments_tools.optimizers
 
+import schedulefree
+
 
 def get_cls_by_name(name: str) -> type:
     """Get class by its name and module path.
@@ -73,6 +75,8 @@ def get_optimizer(name: str):
         return getattr(torch.optim, name)
     if hasattr(transformers.optimization, name):
         return getattr(transformers.optimization, name)
+    if hasattr(schedulefree, name):
+        return getattr(schedulefree, name)
     try:
         apex_opt = importlib.import_module('apex.optimizers')
         return getattr(apex_opt, name)
@@ -201,3 +205,39 @@ def prepare_run(args, logger=None, logger_fmt: str = '%(asctime)s - %(name)s - %
 
     if rank == 0 and args.model_path is None and logger is not None:
         logger.warning('model_path is not set: config, logs and checkpoints will not be saved.')
+
+
+class ObjectView(dict):
+    def __init__(self, *args, **kwargs):
+        super(ObjectView, self).__init__(**kwargs)
+        for arg in args:
+            if not arg:
+                continue
+            elif isinstance(arg, dict):
+                for key, val in arg.items():
+                    self[key] = val
+            else:
+                raise TypeError()
+        for key, val in kwargs.items():
+            self[key] = val
+
+    def __setattr__(self, key, value):
+        if not hasattr(ObjectView, key):
+            self[key] = value
+        else:
+            raise
+
+    def __setitem__(self, name, value):
+        value = ObjectView(value) if isinstance(value, dict) else value
+        super(ObjectView, self).__setitem__(name, value)
+
+    def __getattr__(self, item):
+        return self.__getitem__(item)
+
+    def __getitem__(self, name):
+        if name not in self:
+            self[name] = {}
+        return super(ObjectView, self).__getitem__(name)
+
+    def __delattr__(self, name):
+        del self[name]

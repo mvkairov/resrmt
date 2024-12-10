@@ -139,3 +139,8 @@ dmypy.json
 .vscode/
 runs/
 data/*.tsv
+
+accel_configs
+*.err
+data
+
