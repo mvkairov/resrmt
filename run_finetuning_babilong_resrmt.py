@@ -105,6 +105,8 @@ parser.add_argument('--residual_memory_count', type=int, default=-1, help='max n
 parser.add_argument('--freeze_model_weights', action='store_true', default=False,
                     help='Stop training all model weights except memory layers')
 parser.add_argument('--backbone_cpt', type=str, default=None, help='backbone model checkpoint path')
+parser.add_argument('--no_memory_cell', action='store_true', default=False,
+                    help='In case the model class implements memory cell functions')
 
 # tokenizer
 # todo: add wordpiece tokenizers support?
@@ -302,7 +304,10 @@ if __name__ == '__main__':
             model = model_cls(config=model_cfg)
         else:
             logger.info(f'Loading pretrained model: {args.from_pretrained}')
-            model = model_cls.from_pretrained(args.from_pretrained, use_safetensors=False)
+            if args.no_memory_cell:
+                model = model_cls.from_pretrained(args.from_pretrained, use_safetensors=False, num_mem_tokens=args.num_mem_tokens)
+            else:
+                model = model_cls.from_pretrained(args.from_pretrained, use_safetensors=False)
 
     if args.use_lora:
         peft_config = LoraConfig(
@@ -328,26 +333,43 @@ if __name__ == '__main__':
 
     # Pass memory settings to pretrained model
     if args.num_mem_tokens is not None:
-        memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
-        recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
-        logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
-        
-        cell = memory_cell_cls(model, args.num_mem_tokens)
-        if args.segment_alignment not in {None, 'left'}:
-            logger.info(f"Using custom segment alignment: {args.segment_alignment}")
-        
-        max_n_segments = args.max_n_segments
-        if max_n_segments in {-1, None}:
-            max_n_segments = np.ceil(args.sample_size / args.segment_size)
-        model = recurrent_wrapper_cls(
-            cell, 
-            segment_size=args.segment_size,
-            max_n_segments=max_n_segments, 
-            segment_alignment=args.segment_alignment,
-            k2=args.k2,
-            skip_connection_length=args.skip_connection_length,
-            residual_memory_count=args.residual_memory_count
-        )
+        if args.no_memory_cell:
+            recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
+            logger.info(f'Wrapping in: {recurrent_wrapper_cls}. No memory cell specified, assuming model takes num_mem_tokens argument')
+            max_n_segments = args.max_n_segments
+            if max_n_segments in {-1, None}:
+                max_n_segments = np.ceil(args.sample_size / args.segment_size)
+
+            model = recurrent_wrapper_cls(
+                model,
+                segment_size=args.segment_size,
+                max_n_segments=max_n_segments, 
+                segment_alignment=args.segment_alignment,
+                k2=args.k2,
+                skip_connection_length=args.skip_connection_length,
+                residual_memory_count=args.residual_memory_count
+            )
+
+        else:
+            memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
+            recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
+            logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
+            cell = memory_cell_cls(model, args.num_mem_tokens)
+            if args.segment_alignment not in {None, 'left'}:
+                logger.info(f"Using custom segment alignment: {args.segment_alignment}")
+            
+            max_n_segments = args.max_n_segments
+            if max_n_segments in {-1, None}:
+                max_n_segments = np.ceil(args.sample_size / args.segment_size)
+            model = recurrent_wrapper_cls(
+                cell, 
+                segment_size=args.segment_size,
+                max_n_segments=max_n_segments, 
+                segment_alignment=args.segment_alignment,
+                k2=args.k2,
+                skip_connection_length=args.skip_connection_length,
+                residual_memory_count=args.residual_memory_count
+            )
                                     
 
         ## load cpt of rmt

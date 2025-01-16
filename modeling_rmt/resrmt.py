@@ -127,22 +127,28 @@ class MemoryAttention(torch.nn.Module):
         self.norm2 = torch.nn.LayerNorm(memory_dim)
 
     def forward(self, current_memory, prev_memories):
-        if len(prev_memories) == 0:
+        if len(prev_memories) == 0 or self.residual_memory_count == 0:
+            # if return_attention_map:
+            #     return current_memory, None
             return current_memory
-
-        if self.residual_memory_count > 0:
+        
+        elif self.residual_memory_count > 0:
             memory_dropout = random.sample(prev_memories, min(len(prev_memories), self.residual_memory_count))
             memory_cat = torch.cat(memory_dropout, dim=1)
-            attn_output, _ = self.attention(query=current_memory, key=memory_cat, value=memory_cat)
+            attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat) # K [memory_dim, n_tokens * n_memory] @ V^T
+
         else:
             memory_cat = torch.cat(prev_memories, dim=1)
-            attn_output, _ = self.attention(query=current_memory, key=memory_cat, value=memory_cat)
+            attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat)
 
         updated_memory = current_memory + attn_output 
         updated_memory = self.norm1(updated_memory)
         updated_memory = updated_memory + self.feedforward(updated_memory)
         updated_memory = self.norm2(updated_memory)
-        return updated_memory
+
+        # if return_attention_map:
+        return updated_memory, attn_map
+        # return updated_memory
 
 
 def apply_rope_with_segments(memory_state, segment_num):
@@ -172,29 +178,38 @@ class RecurrentWrapper(torch.nn.Module):
         memory_dim = self.memory_cell.memory.shape[-1]
         self.memory_aggregator = MemoryAttention(memory_dim, rmt_kwargs.get('residual_memory_count'))
 
-    def forward(self, input_ids, labels=None, labels_mask=None, inputs_embeds=None, attention_mask=None, output_attentions=None, output_hidden_states=None):
+    def forward(self, input_ids, labels=None, labels_mask=None, inputs_embeds=None, attention_mask=None, output_attentions=False, output_hidden_states=True, output_aggr_attentions=False):
         memory_state = None
         segmented = self.segment(input_ids=input_ids, inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
         cell_outputs = []
         past_memory_states = []
+        memory_attn_outputs = []
         for seg_num, segment in enumerate(segmented):
-            cell_out, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=True)
+            cell_out, memory_state = self.memory_cell(**segment, memory_state=memory_state, output_hidden_states=output_hidden_states, output_attentions=output_attentions)
             cell_outputs.append(cell_out)
 
             # apply memory aggregation
             if len(segmented) > 1:
-                memory_state = apply_rope_with_segments(memory_state, seg_num)
-                past_memory_states.append(memory_state)
+                # memory_state = apply_rope_with_segments(memory_state, seg_num)
+                past_memory_states.append(apply_rope_with_segments(memory_state, seg_num))
                 memory_state = self.memory_aggregator(memory_state, past_memory_states)
+                # if output_aggr_attentions:
+                memory_state, memory_attn = memory_state
+                memory_attn_outputs.append(memory_attn)
                 memory_state = self.manage_gradients(memory_state, seg_num)
 
         past_memory_states.clear()
 
-        out = self.process_outputs(cell_outputs, labels=labels, 
+
+        out, _ = self.process_outputs(cell_outputs, labels=labels, 
                                    labels_mask=labels_mask,
                                    output_attentions=output_attentions, 
-                                   output_hidden_states=output_hidden_states)
+                                   output_hidden_states=output_hidden_states,
+                                   memory_attn_outputs=memory_attn_outputs)
+                                   
+        if output_aggr_attentions:
+            return out, memory_attn_outputs
         return out
     
     def generate(self, input_ids, attention_mask=None, **generate_kwargs):
@@ -273,15 +288,22 @@ class RecurrentWrapper(torch.nn.Module):
         out['logits'] = full_logits
         segment_keys = ['loss', 'logits']
         if kwargs.get('output_attentions'):
+            print('skubudu bap?')
             segment_keys.append('attentions')
         if kwargs.get('output_hidden_states'):
             segment_keys.append('hidden_states')
             out['hidden_states'] = full_hidden_states
+        # if len(kwargs.get('memory_attn_outputs', [])) > 0:
+        #     print('skibidi dop!')
+        #     out['memory_attn_outputs'] = kwargs.get('memory_attn_outpus')
 
         for seg_num, o in enumerate(cell_outputs):
             for key, value in o.items():
                 if any([sk in key for sk in segment_keys]):
                     out[f'{key}_{seg_num}'] = value
+
+        if kwargs.get('memory_attn_outputs', False):
+            return out, kwargs.get('memory_attn_outputs')
 
         return out 
         

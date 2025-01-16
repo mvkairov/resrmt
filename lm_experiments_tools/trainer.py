@@ -627,7 +627,8 @@ class Trainer:
                     
                 # добавил остановку обучения если достигли наилучшего значения метрики
                 if valid_metric == self.args.best_metric_value:
-                    self.early_stopping_counter = 1e6
+                    logger.info('Early stopping triggered: stopping training')
+                    break
 
                 if self.lr_drop_scheduler:
                     self.lr_drop_scheduler.step(valid_metric)
