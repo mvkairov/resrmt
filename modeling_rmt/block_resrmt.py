@@ -5,17 +5,17 @@ import math
 import random
 
 from transformers.generation.utils import GenerationMixin
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model, GPT2PreTrainedModel
+from transformers.models.gpt2.modeling_gpt2 import GPT2Model
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions, BaseModelOutputWithPastAndCrossAttentions
 
 import accelerate
 from accelerate.logging import get_logger
 logger = get_logger('')
 
-from lm_experiments_tools.utils import ObjectView
+from lm_experiments_tools.utils import ObjectView, RMTOutput
     
 
-class GPT2ModelWithBlockWiseMemory(GPT2Model):
+class GPT2ModelWithBlockWiseMemory(GPT2Model, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     
     def __init__(self, config, num_mem_tokens=None):
@@ -34,6 +34,9 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
         for i in range(config.n_layer):
             self.create_memory(self.num_mem_tokens, i)
 
+        self._gen_indicator = 0
+        self._gen_pass_counter = 0
+
     def create_memory(self, num_mem_tokens, i=None):
         memory_dim = getattr(self.config, 'n_embd', self.config.hidden_size)
         memory_weights = torch.randn((num_mem_tokens, memory_dim)) * self.wte.weight.data.std()
@@ -47,16 +50,16 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
         memory = getattr(self, f"memory_{i}").repeat(input_shape[0], 1, 1)
         return memory
     
-    def pad_attention_mask(self, attention_mask):
+    def pad_attention_mask(self, attention_mask, shape, write_mem=True):
         if self.num_mem_tokens in {0, None}:
             return attention_mask
+
+        mask = torch.zeros(*shape[:2], dtype=self.dtype)[:, None, None, :].to(attention_mask.device)
+        if write_mem:
+            mask[..., self.num_mem_tokens: self.num_mem_tokens + attention_mask.shape[-1]] = attention_mask
         else:
-            # print(shape, attention_mask.shape)
-            shape = list(attention_mask.shape)
-            shape[-1] += self.num_mem_tokens * 2
-            mask = torch.ones(*shape, dtype=torch.int64).to(attention_mask.device)
-            mask[..., self.num_mem_tokens:-self.num_mem_tokens] = attention_mask
-            return mask
+            mask[..., self.num_mem_tokens:] = attention_mask[..., -shape[1] + self.num_mem_tokens:]
+        return mask
     
     def process_input(self, input_ids, memory_state, write_mem, **kwargs):
         inputs_embeds = kwargs.get('inputs_embeds')
@@ -104,8 +107,13 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
         return_dict=None,
         memory_states=None,
         labels=None,
+        write_mem=False,
         **kwargs,
     ):
+        
+        # print(input_ids.shape, attention_mask.shape)
+        if position_ids is not None:
+            position_ids = None
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -149,21 +157,8 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
         if attention_mask is not None:
             assert batch_size > 0, "batch_size has to be defined and > 0"
             attention_mask = attention_mask.view(batch_size, -1)
-            # We create a 3D attention mask from a 2D tensor mask.
-            # Sizes are [batch_size, 1, 1, to_seq_length]
-            # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
-            # this attention mask is more simple than the triangular masking of causal attention
-            # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
             attention_mask = attention_mask[:, None, None, :]
-
-            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-            # masked positions, this operation will create a tensor which is 0.0 for
-            # positions we want to attend and -10000.0 for masked positions.
-            # Since we are adding it to the raw scores before the softmax, this is
-            # effectively the same as removing these entirely.
-            attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-            attention_mask = self.pad_attention_mask(attention_mask)
-
+            attention_mask = attention_mask.to(dtype=self.dtype)
             attention_mask = (1.0 - attention_mask) * -10000.0
 
         # If a 2D ou 3D attention mask is provided for the cross-attention
@@ -200,6 +195,16 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
         all_hidden_states = () if output_hidden_states else None
         all_memory_states = []
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+            if self.num_mem_tokens not in (None, 0):
+                if memory_states is None:
+                    memory_state = self.set_memory(input_ids.shape, i)
+                else:
+                    memory_state = memory_states[i]
+                
+                if write_mem:
+                    hidden_states = torch.cat([memory_state, hidden_states, memory_state], dim=1) # batch, mem + len + mem, dim
+                elif not self._gen_indicator or self._gen_indicator and self._gen_pass_counter == 0:
+                    hidden_states = torch.cat([memory_state, hidden_states], dim=1)
 
             # Model parallel
             if self.model_parallel:
@@ -215,39 +220,7 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            # if getattr(self.config, "gradient_checkpointing", False) and self.training:
-
-            #     if use_cache:
-            #         logger.warning(
-            #             "`use_cache=True` is incompatible with `config.gradient_checkpointing=True`. Setting "
-            #             "`use_cache=False`..."
-            #         )
-            #         use_cache = False
-
-            #     def create_custom_forward(module):
-            #         def custom_forward(*inputs):
-            #             # None for past_key_value
-            #             return module(*inputs, use_cache, output_attentions)
-
-            #         return custom_forward
-
-            #     outputs = torch.utils.checkpoint.checkpoint(
-            #         create_custom_forward(block),
-            #         hidden_states,
-            #         None,
-            #         attention_mask,
-            #         head_mask[i],
-            #         encoder_hidden_states,
-            #         encoder_attention_mask,
-            #     )
-            # else:
-
-            if memory_states is None:
-                memory_state = self.set_memory(input_ids.shape, i)
-            else:
-                memory_state = memory_states[i]
-            hidden_states = torch.cat([memory_state, hidden_states, memory_state], dim=1)
-
+            # print(hidden_states.shape, attention_mask.shape)
             outputs = block(
                 hidden_states,
                 layer_past=layer_past,
@@ -260,9 +233,14 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
             )
 
             hidden_states = outputs[0]
-            memory_state = hidden_states[:, -self.num_mem_tokens:]
-            all_memory_states.append(memory_state)
-            hidden_states = hidden_states[:, self.num_mem_tokens:-self.num_mem_tokens]
+
+            if self.num_mem_tokens not in (None, 0):
+                if write_mem:
+                    memory_state = hidden_states[:, -self.num_mem_tokens:, :]
+                    all_memory_states.append(memory_state)
+                    hidden_states = hidden_states[:, self.num_mem_tokens:-self.num_mem_tokens, :]
+                elif not self._gen_indicator or self._gen_indicator and self._gen_pass_counter == 0:
+                    hidden_states = hidden_states[:, self.num_mem_tokens:, :]
             
             if use_cache is True:
                 presents = presents + (outputs[1],)
@@ -278,18 +256,21 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
+        if self._gen_indicator:
+            self._gen_pass_counter = 1
+
         hidden_states = self.ln_f(hidden_states)
 
         lm_logits = self.lm_head(hidden_states)
 
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        # loss = None
+        # if labels is not None:
+        #     # Shift so that tokens < n predict n
+        #     shift_logits = lm_logits[..., :-1, :].contiguous()
+        #     shift_labels = labels[..., 1:].contiguous()
+        #     # Flatten the tokens
+        #     loss_fct = nn.CrossEntropyLoss()
+        #     loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         hidden_states = hidden_states.view(*output_shape)
         # Add last hidden state
@@ -299,26 +280,34 @@ class GPT2ModelWithBlockWiseMemory(GPT2Model):
         # if not return_dict:
         #     return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
 
-
-        out = dict(
-            loss=loss,
-            logits=lm_logits,
-            past_key_values=presents,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
-            cross_attentions=all_cross_attentions,
+        out = RMTOutput(
+            # loss=loss,
+            logits = lm_logits,
+            past_key_values = presents,
+            hidden_states = all_hidden_states,
+            attentions = all_self_attentions,
+            cross_attentions = all_cross_attentions,
+            memory_states = all_memory_states
         )
-        return out, all_memory_states
+        return out
+
+    def generate(self, *args, **kwargs):
+        self._gen_indicator = 1
+        self._gen_pass_counter = 0
+        out = super().generate(*args, **kwargs)
+        self._gen_indicator = 0
+        return out
+
 
 
 class MemoryAttention(torch.nn.Module):
-    def __init__(self, memory_dim, residual_memory_count=None, hidden_dim=None, num_heads=1):
+    def __init__(self, memory_dim, res_mem_count=None, hidden_dim=None, num_heads=1):
         super().__init__()
         if hidden_dim is None:
             hidden_dim = memory_dim * 4
 
         self.memory_dim = memory_dim
-        self.residual_memory_count = residual_memory_count
+        self.res_mem_count = res_mem_count
         self.attention = torch.nn.MultiheadAttention(embed_dim=memory_dim, num_heads=num_heads, batch_first=True)
         self.feedforward = torch.nn.Sequential(
             torch.nn.Linear(memory_dim, hidden_dim),
@@ -329,11 +318,11 @@ class MemoryAttention(torch.nn.Module):
         self.norm2 = torch.nn.LayerNorm(memory_dim)
 
     def forward(self, current_memory, prev_memories):
-        if len(prev_memories) == 0 or self.residual_memory_count == 0:
+        if len(prev_memories) == 0 or self.res_mem_count == 0:
             return current_memory, None
         
-        elif self.residual_memory_count > 0:
-            memory_dropout = random.sample(prev_memories, min(len(prev_memories), self.residual_memory_count))
+        elif self.res_mem_count > 0:
+            memory_dropout = random.sample(prev_memories, min(len(prev_memories), self.res_mem_count))
             memory_cat = torch.cat(memory_dropout, dim=1)
             attn_output, attn_map = self.attention(query=current_memory, key=memory_cat, value=memory_cat) # K [memory_dim, n_tokens * n_memory] @ V^T
 
@@ -377,8 +366,8 @@ class RecurrentWrapper(torch.nn.Module):
 
         memory_dim = self.model.memory_0.shape[-1]
         self.n_layer = self.model.config.n_layer
-        if rmt_kwargs.get('residual_memory_count', None) is not None:
-            self.memory_aggregator = nn.ModuleList([MemoryAttention(memory_dim, rmt_kwargs.get('residual_memory_count')) for _ in range(self.n_layer)])
+        if rmt_kwargs.get('res_mem_count', None) not in (0, None):
+            self.memory_aggregator = nn.ModuleList([MemoryAttention(memory_dim, rmt_kwargs.get('res_mem_count')) for _ in range(self.n_layer)])
         else:
             self.memory_aggregator = None
 
@@ -389,9 +378,14 @@ class RecurrentWrapper(torch.nn.Module):
         cell_outputs = []
         past_memory_states = [[] for _ in range(self.n_layer)]
         memory_attn_outputs = [[] for _ in range(self.n_layer)]
+        padded_attn_mask = None
         for seg_num, segment in enumerate(segmented):
-            cell_out, memory_states = self.model(**segment, memory_states=memory_states, output_hidden_states=output_hidden_states, output_attentions=output_attentions)
+            if padded_attn_mask is None or seg_num == len(segmented) - 1:
+                padded_attn_mask = self.pad_attention_mask(segment['attention_mask'], segment['input_ids'].shape, write_mem=True)
+            segment['attention_mask'] = padded_attn_mask
+            cell_out = self.model(**segment, memory_states=memory_states, write_mem=True, output_hidden_states=output_hidden_states, output_attentions=output_attentions)
             cell_outputs.append(cell_out)
+            memory_states = cell_out.memory_states
 
             # apply memory aggregation
             if len(segmented) > 1 and self.memory_aggregator is not None:
@@ -401,6 +395,8 @@ class RecurrentWrapper(torch.nn.Module):
                     memory_attn_outputs[i].append(memory_attn)
                     memory_states[i] = self.manage_gradients(memory_states[i], seg_num)
 
+        for i in range(len(past_memory_states)):
+            past_memory_states[i].clear()
         past_memory_states.clear()
 
 
@@ -413,13 +409,18 @@ class RecurrentWrapper(torch.nn.Module):
         return out
     
     def generate(self, input_ids, attention_mask=None, **generate_kwargs):
-        memory_state = None
+        memory_states = None
         segmented = self.segment(input_ids=input_ids, attention_mask=attention_mask)
 
-        # print('\n\n\nGenerate: ', [s['input_ids'].shape for s in segmented])
-        past_memory_states = []
+        padded_attn_mask = None
+
+        past_memory_states = [[] for _ in range(self.n_layer)]
         for seg_num, segment in enumerate(segmented[:-1]):
-            _, memory_states = self.model(**segment, memory_states=memory_states, output_hidden_states=True)
+            if padded_attn_mask is None:
+                padded_attn_mask = self.pad_attention_mask(segment['attention_mask'], segment['input_ids'].shape, write_mem=True)
+            segment['attention_mask'] = padded_attn_mask
+            out = self.model(**segment, memory_states=memory_states, write_mem=True, output_hidden_states=True)
+            memory_states = out.memory_states
 
             if len(segmented) > 1 and self.memory_aggregator is not None:
                 for i in range(self.n_layer):
@@ -427,15 +428,33 @@ class RecurrentWrapper(torch.nn.Module):
                     memory_states[i], _ = self.memory_aggregator[i](memory_states[i], past_memory_states[i])
                     # memory_attn_outputs[i].append(memory_attn)
                     memory_states[i] = self.manage_gradients(memory_states[i], seg_num)
-            # memory_state = apply_rope_with_segments(memory_state, seg_num)
-            # past_memory_states.append(memory_state)
-            # memory_state = self.memory_aggregator(memory_state, past_memory_states)
 
         final_segment = segmented[-1]
-        out = self.model.generate(**final_segment, memory_state=memory_state, **generate_kwargs)
+        final_segment['attention_mask'] = self.pad_attention_mask(final_segment['attention_mask'], final_segment['input_ids'].shape, write_mem=False)
+        out = self.model.generate(**final_segment, memory_states=memory_states, write_mem=False, **generate_kwargs)
+
+        for i in range(len(past_memory_states)):
+            past_memory_states[i].clear()
         past_memory_states.clear()
 
         return out
+    
+    def pad_attention_mask(self, attention_mask, input_shape, write_mem=True):
+        if attention_mask is None:
+            return None
+
+        input_shape = list(input_shape)
+        num_mem_tokens = self.model.num_mem_tokens
+
+        if num_mem_tokens in [0, None]:
+            return attention_mask
+        if write_mem:
+            input_shape[1] += 2 * num_mem_tokens
+        else:
+            input_shape[1] += num_mem_tokens
+        mask = torch.ones(*input_shape[:2], dtype=torch.int64).to(attention_mask.device)
+        mask[:, num_mem_tokens: num_mem_tokens + attention_mask.shape[1]] = attention_mask
+        return mask
 
     def segment(self, **kwargs):
         segments = []
@@ -467,10 +486,7 @@ class RecurrentWrapper(torch.nn.Module):
         return segments
 
     def process_outputs(self, cell_outputs, **kwargs):
-        out = CausalLMOutputWithCrossAttentions()
-
-        # print(cell_outputs)
-        # print(cell_outputs[0])
+        out = RMTOutput()
 
         full_logits = torch.cat([o['logits'] for o in cell_outputs], dim=1)
         full_hidden_states = tuple([torch.cat(layer_hs, dim=1) for layer_hs in zip(*[o['hidden_states'] for o in cell_outputs])])
@@ -499,18 +515,16 @@ class RecurrentWrapper(torch.nn.Module):
         out['logits'] = full_logits
         segment_keys = ['loss', 'logits']
         if kwargs.get('output_attentions'):
-            print('skubudu bap?')
             segment_keys.append('attentions')
         if kwargs.get('output_hidden_states'):
             segment_keys.append('hidden_states')
             out['hidden_states'] = full_hidden_states
         # if len(kwargs.get('memory_attn_outputs', [])) > 0:
-        #     print('skibidi dop!')
         #     out['memory_attn_outputs'] = kwargs.get('memory_attn_outpus')
 
         for seg_num, o in enumerate(cell_outputs):
             for key, value in o.items():
-                if any([sk in key for sk in segment_keys]) and value is not None:
+                if any([sk in key for sk in segment_keys]): # and value is not None:
                     out[f'{key}_{seg_num}'] = value
 
         # if kwargs.get('memory_attn_outputs', False):

@@ -82,12 +82,14 @@ parser.add_argument('--recurrent_wrapper_cls', type=str, default=None, help='rec
 parser.add_argument('--model_type', type=str, default='encoder-decoder',
                     help='model type, encoder, encoder-decoder, decoder, affects preprocessing '
                          '(default: encoder-decoder)')
+parser.add_argument('--layers_attr', type=str, default=None, help='attribute of model, which contains layers')
 
 # Babilong parameters
 parser.add_argument('--sample_size', type=int, default=512, help='max number of tokens in sample')
 parser.add_argument('--max_n_facts', type=int, default=None, help='drop samples with higher number of facts')
 parser.add_argument('--task_start_pct', type=float, default=0, help='left border of facts in sample, between 0 and 1')
 parser.add_argument('--task_end_pct', type=float, default=1, help='right border of facts in sample, between task_start_pct and 1')
+parser.add_argument('--sep_seg_q', action='store_true', default=False, help='ask question in a separate segment')
 
 
 # RMT args 
@@ -101,7 +103,7 @@ parser.add_argument('--bptt_depth', type=int, default=-1, help='max number of pr
 parser.add_argument('--segment_alignment', type=str, help='way of aligning segments, one of right, left, center', default=None)
 parser.add_argument('--k2', type=int, default=-1, help='number of last segments used by backward')
 parser.add_argument('--skip_connection_length', type=int, default=-1, help='how many segments back are connected')
-parser.add_argument('--residual_memory_count', type=int, default=-1, help='max number of memory segments to keep after dropout')
+parser.add_argument('--res_mem_count', type=int, default=-1, help='max number of memory segments to keep after dropout')
 parser.add_argument('--freeze_model_weights', action='store_true', default=False,
                     help='Stop training all model weights except memory layers')
 parser.add_argument('--backbone_cpt', type=str, default=None, help='backbone model checkpoint path')
@@ -235,8 +237,15 @@ if __name__ == '__main__':
 
     def collate_fn(batch):
         targets = [torch.tensor(b['target_tokens']) for b in batch]
-        input_ids = [torch.tensor(b['input_tokens'] + b['question_tokens'] + [gen_token] + b['target_tokens'] + [eos_token]) for b in batch]
-        gen_inputs = [torch.tensor(b['input_tokens'] + b['question_tokens'] + [gen_token]) for b in batch]
+        
+        if args.sep_seg_q:
+            input_ids = [torch.tensor(b['input_tokens'] + ((-len(b['input_tokens'])) % args.segment_size) * [id_pad_value] +
+                                      b['question_tokens'] + [gen_token] + b['target_tokens'] + [eos_token]) for b in batch]
+            gen_inputs = [torch.tensor(b['input_tokens'] + ((-len(b['input_tokens'])) % args.segment_size) * [id_pad_value] +
+                                       b['question_tokens'] + [gen_token]) for b in batch]
+        else:
+            input_ids = [torch.tensor(b['input_tokens'] + b['question_tokens'] + [gen_token] + b['target_tokens'] + [eos_token]) for b in batch]
+            gen_inputs = [torch.tensor(b['input_tokens'] + b['question_tokens'] + [gen_token]) for b in batch]
 
         attention_mask = [torch.ones_like(b, dtype=int) for b in input_ids]
         labels_mask = [torch.zeros_like(b, dtype=bool) for b in input_ids]
@@ -347,14 +356,24 @@ if __name__ == '__main__':
                 segment_alignment=args.segment_alignment,
                 k2=args.k2,
                 skip_connection_length=args.skip_connection_length,
-                residual_memory_count=args.residual_memory_count
+                res_mem_count=args.res_mem_count
             )
 
         else:
+            mem_cell_args = dict(
+                base_model=model,
+            )
+            if args.num_mem_tokens is not None:
+                mem_cell_args["num_mem_tokens"] = args.num_mem_tokens
+            if args.memory_cell_cls == 'modeling_rmt.rmt_br:MemoryCell':
+                if args.layers_attr is not None:
+                    mem_cell_args["layers_attr"] = args.layer_attr
+                mem_cell_args["res_mem_count"] = args.res_mem_count
+
             memory_cell_cls = get_cls_by_name(args.memory_cell_cls)
             recurrent_wrapper_cls = get_cls_by_name(args.recurrent_wrapper_cls)
             logger.info(f'Wrapping in: {memory_cell_cls} and {recurrent_wrapper_cls}')
-            cell = memory_cell_cls(model, args.num_mem_tokens)
+            cell = memory_cell_cls(**mem_cell_args)
             if args.segment_alignment not in {None, 'left'}:
                 logger.info(f"Using custom segment alignment: {args.segment_alignment}")
             
@@ -368,7 +387,7 @@ if __name__ == '__main__':
                 segment_alignment=args.segment_alignment,
                 k2=args.k2,
                 skip_connection_length=args.skip_connection_length,
-                residual_memory_count=args.residual_memory_count
+                res_mem_count=args.res_mem_count
             )
                                     
 
@@ -445,13 +464,23 @@ if __name__ == '__main__':
         # compute metrics based on stored labels, predictions, ...
         metrics = {}
         if 'generation_outputs' in data:
-            generation_outputs = tokenizer.batch_decode([d for d in data['generation_outputs']], add_special_tokens=False)
-            for i, o in enumerate(generation_outputs):
+            p = tokenizer.batch_decode([d for d in data['generation_outputs']], add_special_tokens=False)
+            for i, o in enumerate(p):
                 if '<|endoftext|>' in o:
                     # print(f"gt: {data['target_text'][i]}, generated {o}")
-                    generation_outputs[i] = o.split('<|endoftext|>')[1].strip()
+                    p[i] = o.split('<|endoftext|>')[1].strip()
 
-            metrics['exact_match'] = np.mean([text == pred for text, pred in zip (data['target_text'], generation_outputs)])
+            y = data['target_text']
+            metrics['exact_match'] = np.mean([text == pred for text, pred in zip (data['target_text'], p)])
+            if args.show_valid_examples > 0:
+                for i in range(min(args.show_valid_examples, len(y))):
+                    # logger.info(f'y: {y[i][-50:]}')
+                    # logger.info(f'p: {p[i][-50:]}')
+
+                    logger.info(f"y_text: {data['target_text'][i]}")
+                    logger.info(f"p_text: {p[i]}")
+
+                    logger.info('-' * 50)
 
         elif 'predictions' in data:
             y, p = data['labels'], data['predictions']

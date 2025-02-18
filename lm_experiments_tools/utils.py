@@ -17,6 +17,9 @@ import transformers
 import lm_experiments_tools.optimizers
 
 import schedulefree
+from transformers.modeling_outputs import ModelOutput
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 
 def get_cls_by_name(name: str) -> type:
@@ -241,3 +244,14 @@ class ObjectView(dict):
 
     def __delattr__(self, name):
         del self[name]
+
+
+@dataclass
+class RMTOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    cross_attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    memory_states: Optional[list[torch.FloatTensor, ...]] = None
